@@ -508,7 +508,11 @@
     }
   });
 
-  // Online count polling
+  socket.on('online_count', data => {
+    document.getElementById('online-count').textContent = data.count + ' online';
+  });
+
+  // Online count polling as fallback
   async function updateOnline() {
     try {
       const r = await fetch('/api/online');
