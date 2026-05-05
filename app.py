@@ -27,6 +27,7 @@ db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 typing_users = set()
+online_users = set()  # track online users by username
 
 # ──────────────────────────────────────────
 #  Models
@@ -128,7 +129,7 @@ def logout():
 
 @app.route('/api/online')
 def online_count():
-    return jsonify({'count': len(socketio.server.manager.rooms.get('/', {}).get('/', set()))})
+    return jsonify({'count': len(online_users)})
 
 # ──────────────────────────────────────────
 #  Socket.IO events
@@ -139,13 +140,17 @@ def on_connect():
     if 'user_id' not in session:
         return False
     join_room('global')
+    online_users.add(session['username'])
     emit('system', {'msg': f"{session['username']} joined the chat ⚡"}, to='global')
+    emit('online_count', {'count': len(online_users)}, to='global')
 
 @socketio.on('disconnect')
 def on_disconnect():
     if 'username' in session:
+        online_users.discard(session['username'])
         typing_users.discard(session['username'])
         emit('typing_update', list(typing_users), to='global')
+        emit('online_count', {'count': len(online_users)}, to='global')
         emit('system', {'msg': f"{session['username']} left the chat"}, to='global')
 
 @socketio.on('typing')
