@@ -1,18 +1,17 @@
+import eventlet
+eventlet.monkey_patch()
+
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify
 from flask_socketio import SocketIO, emit, join_room
 from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 
 app = Flask(__name__)
-
-# Fixed secret key so sessions survive restarts
 app.secret_key = os.environ.get('SECRET_KEY', 'radium-dev-secret-change-in-prod')
 
-# PostgreSQL in production (Neon), fallback to SQLite locally
 DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///radium.db')
-# Neon gives postgres:// but SQLAlchemy needs postgresql://
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 
@@ -25,19 +24,15 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
 
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 typing_users = set()
-online_users = set()  # track online users by username
-
-# ──────────────────────────────────────────
-#  Models
-# ──────────────────────────────────────────
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(30), unique=True, nullable=False)
     password_hash = db.Column(db.String(128), nullable=False)
     joined_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_seen = db.Column(db.DateTime, default=datetime.utcnow)
     messages = db.relationship('Message', backref='author', lazy=True)
 
 class Message(db.Model):
@@ -49,9 +44,16 @@ class Message(db.Model):
 with app.app_context():
     db.create_all()
 
-# ──────────────────────────────────────────
-#  Routes
-# ──────────────────────────────────────────
+def get_online_count():
+    cutoff = datetime.utcnow() - timedelta(seconds=30)
+    return User.query.filter(User.last_seen >= cutoff).count()
+
+def update_last_seen():
+    if 'user_id' in session:
+        user = db.session.get(User, session['user_id'])
+        if user:
+            user.last_seen = datetime.utcnow()
+            db.session.commit()
 
 @app.route('/')
 def index():
@@ -80,7 +82,6 @@ def register():
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '')
         confirm  = request.form.get('confirm', '')
-
         if len(username) < 3:
             error = 'Username must be at least 3 characters.'
         elif len(username) > 30:
@@ -105,10 +106,8 @@ def register():
 def chat():
     if 'user_id' not in session:
         return redirect(url_for('login'))
-    # Load last 60 messages
-    messages = (Message.query
-                .order_by(Message.timestamp.asc())
-                .limit(60).all())
+    update_last_seen()
+    messages = Message.query.order_by(Message.timestamp.asc()).limit(60).all()
     history = [
         {
             'username': m.author.username,
@@ -118,9 +117,7 @@ def chat():
         }
         for m in messages
     ]
-    return render_template('chat.html',
-                           username=session['username'],
-                           history=history)
+    return render_template('chat.html', username=session['username'], history=history)
 
 @app.route('/logout')
 def logout():
@@ -129,29 +126,35 @@ def logout():
 
 @app.route('/api/online')
 def online_count():
-    return jsonify({'count': len(online_users)})
-
-# ──────────────────────────────────────────
-#  Socket.IO events
-# ──────────────────────────────────────────
+    return jsonify({'count': get_online_count()})
 
 @socketio.on('connect')
 def on_connect():
     if 'user_id' not in session:
         return False
     join_room('global')
-    online_users.add(session['username'])
+    update_last_seen()
     emit('system', {'msg': f"{session['username']} joined the chat ⚡"}, to='global')
-    emit('online_count', {'count': len(online_users)}, to='global')
+    emit('online_count', {'count': get_online_count()}, to='global')
 
 @socketio.on('disconnect')
 def on_disconnect():
     if 'username' in session:
-        online_users.discard(session['username'])
+        if 'user_id' in session:
+            user = db.session.get(User, session['user_id'])
+            if user:
+                user.last_seen = datetime.utcnow() - timedelta(minutes=5)
+                db.session.commit()
         typing_users.discard(session['username'])
         emit('typing_update', list(typing_users), to='global')
-        emit('online_count', {'count': len(online_users)}, to='global')
         emit('system', {'msg': f"{session['username']} left the chat"}, to='global')
+        emit('online_count', {'count': get_online_count()}, to='global')
+
+@socketio.on('heartbeat')
+def on_heartbeat():
+    if 'user_id' in session:
+        update_last_seen()
+        emit('online_count', {'count': get_online_count()}, to='global')
 
 @socketio.on('typing')
 def on_typing(data):
@@ -172,6 +175,7 @@ def handle_message(data):
     content = data.get('content', '').strip()
     if not content or len(content) > 1000:
         return
+    update_last_seen()
     msg = Message(content=content, user_id=session['user_id'])
     db.session.add(msg)
     db.session.commit()
@@ -183,6 +187,6 @@ def handle_message(data):
     }, to='global')
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 8000))
     print(f"🟢  Radium Chat running → http://127.0.0.1:{port}")
-    socketio.run(app, debug=False, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
+    socketio.run(app, host='0.0.0.0', port=port, debug=False)
