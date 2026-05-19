@@ -43,6 +43,14 @@ class Message(db.Model):
 
 with app.app_context():
     db.create_all()
+    # Add last_seen column if it doesn't exist yet
+    from sqlalchemy import text, inspect
+    with db.engine.connect() as conn:
+        inspector = inspect(db.engine)
+        columns = [c['name'] for c in inspector.get_columns('user')]
+        if 'last_seen' not in columns:
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN last_seen TIMESTAMP DEFAULT NOW()'))
+            conn.commit()
 
 def get_online_count():
     cutoff = datetime.utcnow() - timedelta(seconds=30)
